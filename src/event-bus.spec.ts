@@ -396,7 +396,9 @@ async function ejecutarPruebasUnitarias(): Promise<void> {
     assert.doesNotThrow(() => exigirEventoSinPii(valido), 'el evento no lleva PII');
 
     const { habitacionFisicaId: _falta, ...sinHabitacion } = valido;
-    assert.ok(erroresHabitacionLimpiaLista(sinHabitacion).some((e) => e.startsWith('habitacionFisicaId')));
+    assert.deepEqual(erroresHabitacionLimpiaLista(sinHabitacion), [], 'habitacionFisicaId es opcional');
+    assert.deepEqual(erroresHabitacionLimpiaLista({ ...valido, habitacionFisicaId: null }), [], 'habitacionFisicaId null es válido');
+    assert.ok(erroresHabitacionLimpiaLista({ ...valido, habitacionFisicaId: '' }).some((e) => e.startsWith('habitacionFisicaId')));
     assert.ok(erroresHabitacionLimpiaLista({ ...valido, checkin: '2026-13-40' }).some((e) => e.startsWith('checkin')));
     assert.ok(erroresHabitacionLimpiaLista({ ...valido, checkout: '2026-11-20' }).some((e) => e.includes('posterior')));
     assert.ok(erroresHabitacionLimpiaLista({ ...valido, timestamp: '2026-11-22 10:30' }).some((e) => e.startsWith('timestamp')));

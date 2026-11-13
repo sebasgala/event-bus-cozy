@@ -96,7 +96,7 @@ export interface DatosHabitacionLimpiaLista {
   alojamientoId: string;
   tipoHabitacionCodigo: string;
   tipoHabitacionId?: string;
-  habitacionFisicaId: string;
+  habitacionFisicaId?: string | null;
   /** YYYY-MM-DD */
   checkin: string;
   /** YYYY-MM-DD */
@@ -110,7 +110,7 @@ export type HabitacionLimpiaListaEvent = EventoCozy<typeof EVENTO_HABITACION_LIM
 
 const FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const INSTANTE_CON_ZONA = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
-const OBLIGATORIOS = ['reservaId', 'alojamientoId', 'tipoHabitacionCodigo', 'habitacionFisicaId', 'checkin', 'checkout', 'timestamp'] as const;
+const OBLIGATORIOS = ['reservaId', 'alojamientoId', 'tipoHabitacionCodigo', 'checkin', 'checkout', 'timestamp'] as const;
 
 const esFechaReal = (v: string) => FECHA.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`)) && new Date(`${v}T00:00:00Z`).toISOString().startsWith(v);
 
@@ -121,6 +121,9 @@ export function erroresHabitacionLimpiaLista(datos: unknown): string[] {
   const errores: string[] = [];
   for (const campo of OBLIGATORIOS) {
     if (typeof d[campo] !== 'string' || (d[campo] as string).trim() === '') errores.push(`${campo} es obligatorio y debe ser texto`);
+  }
+  if (d.habitacionFisicaId !== undefined && d.habitacionFisicaId !== null && (typeof d.habitacionFisicaId !== 'string' || d.habitacionFisicaId.trim() === '')) {
+    errores.push('habitacionFisicaId debe ser texto');
   }
   if (d.usuarioId !== undefined && (typeof d.usuarioId !== 'string' || d.usuarioId.trim() === '')) errores.push('usuarioId debe ser texto');
   if (typeof d.checkin === 'string' && !esFechaReal(d.checkin)) errores.push('checkin debe tener el formato YYYY-MM-DD');
