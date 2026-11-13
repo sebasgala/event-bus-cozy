@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
+import { esEventoDelContrato } from './catalogo-eventos';
 import { exigirEventoSinPii } from './lopdp';
 import { RabbitMqService, SobreCloudEvent } from './rabbitmq.service';
 import { DominioEvento, EXCHANGE_POR_DOMINIO } from './topologia-rabbitmq';
@@ -19,6 +20,9 @@ import { DominioEvento, EXCHANGE_POR_DOMINIO } from './topologia-rabbitmq';
 
 export const LOTE_PUBLICACION = 500;
 const INTERVALO_MS = 200;
+
+// Sentinel usado en outbox.sequence para eventos internos: procesados pero sin sequence real en el feed.
+export const SEQUENCE_INTERNO = 0;
 
 export const SQL_CANDADO = `SELECT "ultimo"::bigint AS "ultimo" FROM "comun"."feed_publicador" WHERE "id" = 1 FOR UPDATE SKIP LOCKED`;
 
@@ -132,6 +136,7 @@ export class PublicadorOutboxService implements OnApplicationBootstrap, OnModule
 
   // Lee hasta `lote` eventos pendientes bajo el candado de comun.feed_publicador, los publica en orden
   // en RabbitMQ esperando publisher confirm, y solo marca sequence + escribe feed_eventos tras la confirmación.
+  // Eventos internos (esEventoDelContrato=false): van a RabbitMQ pero NO a comun.feed_eventos ni al contador.
   async publicarLote(lote = LOTE_PUBLICACION): Promise<number> {
     return this.dataSource.transaction(async (manager) => {
       const [candado] = await manager.query(SQL_CANDADO);
@@ -141,7 +146,19 @@ export class PublicadorOutboxService implements OnApplicationBootstrap, OnModule
       if (pendientes.length === 0) return 0;
 
       const fuente = `urn:${nodoCodigo().toLowerCase()}:alojamientos`;
-      const confirmados: FilaOutboxPendiente[] = [];
+
+      // Pre-asigna sequences contiguos solo a los eventos del contrato (sin huecos aunque haya internos en el lote)
+      const ultimoInicial = Number(candado.ultimo);
+      const sequencePorId = new Map<string | number, number>();
+      {
+        let idx = 0;
+        for (const fila of pendientes) {
+          if (esEventoDelContrato(fila.tipo)) sequencePorId.set(fila.id, ultimoInicial + (++idx));
+        }
+      }
+
+      const confirmadosContrato: FilaOutboxPendiente[] = [];
+      const confirmadosInternos: FilaOutboxPendiente[] = [];
       let errorPublicacion: Error | null = null;
 
       for (const fila of pendientes) {
@@ -149,7 +166,9 @@ export class PublicadorOutboxService implements OnApplicationBootstrap, OnModule
           // Verificación LOPDP (§7.1): ningún evento puede contener datos personales (PII)
           exigirEventoSinPii(fila.datos);
 
-          const sequence = Number(fila.nuevo);
+          const esContrato = esEventoDelContrato(fila.tipo);
+          // Eventos internos usan SEQUENCE_INTERNO en el sobre (no van al feed, no tienen sequence real)
+          const sequence = esContrato ? sequencePorId.get(fila.id)! : SEQUENCE_INTERNO;
           const sobre: SobreCloudEvent = {
             id: fila.eventoId,
             source: fuente,
@@ -171,21 +190,26 @@ export class PublicadorOutboxService implements OnApplicationBootstrap, OnModule
               : {}),
           });
 
-          // Solo se agrega a confirmados DESPUÉS de que RabbitMQ devuelve el publisher confirm
-          confirmados.push(fila);
+          // Solo se agrega a la lista DESPUÉS de que RabbitMQ devuelve el publisher confirm
+          if (esContrato) confirmadosContrato.push(fila);
+          else confirmadosInternos.push(fila);
         } catch (err) {
           errorPublicacion = err as Error;
           break;
         }
       }
 
-      if (confirmados.length === 0 && errorPublicacion) {
-        throw errorPublicacion;
+      const totalConfirmados = confirmadosContrato.length + confirmadosInternos.length;
+      if (totalConfirmados === 0 && errorPublicacion) throw errorPublicacion;
+
+      // Eventos internos: marcar outbox como procesados con sentinel; NO tocar feed ni contador
+      for (const fila of confirmadosInternos) {
+        await manager.query(SQL_MARCAR_OUTBOX[fila.origen], [SEQUENCE_INTERNO, fila.id]);
       }
 
-      // Persiste únicamente los eventos que RabbitMQ ya confirmó, en el mismo orden de sequence
-      for (const fila of confirmados) {
-        const sequence = Number(fila.nuevo);
+      // Eventos del contrato: insertar en feed y marcar con sequence contiguo
+      for (const fila of confirmadosContrato) {
+        const sequence = sequencePorId.get(fila.id)!;
         await manager.query(SQL_INSERTAR_FEED, [
           sequence,
           fila.eventoId,
@@ -199,16 +223,18 @@ export class PublicadorOutboxService implements OnApplicationBootstrap, OnModule
         await manager.query(SQL_MARCAR_OUTBOX[fila.origen], [sequence, fila.id]);
       }
 
-      const ultimoConfirmado = Number(confirmados[confirmados.length - 1].nuevo);
-      await manager.query(SQL_ACTUALIZAR_CONTADOR, [ultimoConfirmado]);
+      if (confirmadosContrato.length > 0) {
+        const ultimoContrato = ultimoInicial + confirmadosContrato.length;
+        await manager.query(SQL_ACTUALIZAR_CONTADOR, [ultimoContrato]);
+      }
 
       if (errorPublicacion) {
         this.log.warn(
-          `Se confirmaron ${confirmados.length}/${pendientes.length} eventos antes de fallo en RabbitMQ (${errorPublicacion.message}); el resto se reintentará.`,
+          `Se confirmaron ${totalConfirmados}/${pendientes.length} eventos antes de fallo en RabbitMQ (${errorPublicacion.message}); el resto se reintentará.`,
         );
       }
 
-      return confirmados.length;
+      return totalConfirmados;
     });
   }
 

@@ -1,6 +1,13 @@
 import './registro-rutas';
 import 'reflect-metadata';
 import * as assert from 'assert';
+import {
+  DatosHabitacionLimpiaLista,
+  erroresHabitacionLimpiaLista,
+  esEventoDelContrato,
+  esHabitacionLimpiaLista,
+  EVENTO_HABITACION_LIMPIA_LISTA,
+} from './catalogo-eventos';
 import { CanalConfirmacionAmqp, ConexionAmqp, MensajeAmqp } from './cliente-amqp';
 import { ConexionPorRolIncompleta, opcionesBaseDatosEventBus } from './conexiones';
 import { ConsumidorEjemploService } from './consumidor-ejemplo.service';
@@ -10,6 +17,7 @@ import {
   FilaOutboxPendiente,
   PublicadorOutboxService,
   resolverPublicadorActivo,
+  SEQUENCE_INTERNO,
   SQL_ACTUALIZAR_CONTADOR,
   SQL_CANDADO,
   SQL_INSERTAR_FEED,
@@ -361,6 +369,188 @@ async function ejecutarPruebasUnitarias(): Promise<void> {
     } finally {
       if (anterior === undefined) delete process.env.PUBLICADOR_ACTIVO;
       else process.env.PUBLICADOR_ACTIVO = anterior;
+    }
+  }
+
+  // 8. Catálogo de eventos: habitacion.limpia.lista es interno (no entra al EventType cerrado del contrato)
+  {
+    assert.equal(EVENTO_HABITACION_LIMPIA_LISTA, 'habitacion.limpia.lista');
+    assert.equal(esEventoDelContrato(EVENTO_HABITACION_LIMPIA_LISTA), false);
+    assert.equal(esEventoDelContrato('alojamiento.checkout.completado'), true);
+
+    const valido: DatosHabitacionLimpiaLista = {
+      reservaId: '11111111-1111-4111-8111-111111111111',
+      alojamientoId: 'HTL-COZY-UIO-001',
+      tipoHabitacionCodigo: 'SUITE',
+      tipoHabitacionId: '22222222-2222-4222-8222-222222222222',
+      habitacionFisicaId: '33333333-3333-4333-8333-333333333333',
+      checkin: '2026-11-20',
+      checkout: '2026-11-22',
+      usuarioId: '44444444-4444-4444-8444-444444444444',
+      timestamp: '2026-11-22T10:30:00-05:00',
+    };
+    assert.deepEqual(erroresHabitacionLimpiaLista(valido), []);
+    assert.equal(esHabitacionLimpiaLista(valido), true);
+    const { usuarioId: _sinUsuario, ...sinUsuario } = valido;
+    assert.equal(esHabitacionLimpiaLista(sinUsuario), true, 'usuarioId es opcional');
+    assert.doesNotThrow(() => exigirEventoSinPii(valido), 'el evento no lleva PII');
+
+    const { habitacionFisicaId: _falta, ...sinHabitacion } = valido;
+    assert.ok(erroresHabitacionLimpiaLista(sinHabitacion).some((e) => e.startsWith('habitacionFisicaId')));
+    assert.ok(erroresHabitacionLimpiaLista({ ...valido, checkin: '2026-13-40' }).some((e) => e.startsWith('checkin')));
+    assert.ok(erroresHabitacionLimpiaLista({ ...valido, checkout: '2026-11-20' }).some((e) => e.includes('posterior')));
+    assert.ok(erroresHabitacionLimpiaLista({ ...valido, timestamp: '2026-11-22 10:30' }).some((e) => e.startsWith('timestamp')));
+    assert.deepEqual(erroresHabitacionLimpiaLista(null), ['data debe ser un objeto']);
+  }
+
+  // 9. Publicador de eventos internos: solo van a RabbitMQ, NO a comun.feed_eventos ni al contador
+  {
+    // 9a. Solo evento interno: se publica en RabbitMQ, outbox marcado con SEQUENCE_INTERNO, sin feed
+    {
+      const sim = crearCanalSimulado();
+      const rabbit = new RabbitMqService(async () => sim.conexion);
+
+      const filaInterna: FilaOutboxPendiente = {
+        origen: 'reservas',
+        id: 55,
+        eventoId: 'evt-limpia-1',
+        tipo: 'habitacion.limpia.lista',
+        sujeto: 'habitaciones-fisicas/33333333-3333-4333-8333-333333333333',
+        alojamientoId: 1,
+        correlacionId: null,
+        datos: {
+          reservaId: '11111111-1111-4111-8111-111111111111',
+          alojamientoId: 'HTL-COZY-UIO-001',
+          tipoHabitacionCodigo: 'SUITE',
+          habitacionFisicaId: '33333333-3333-4333-8333-333333333333',
+          checkin: '2026-11-20',
+          checkout: '2026-11-22',
+          timestamp: '2026-11-22T10:30:00-05:00',
+        },
+        creadoEn: new Date('2026-11-22T15:30:00.000Z'),
+        registradoEn: new Date('2026-11-22T15:30:00.100Z'),
+        nuevo: 1,
+      };
+
+      const feedInsertado9a: unknown[][] = [];
+      const marcados9a: Record<string, { id: number | string; sequence: number }[]> = { reservas: [], disponibilidad: [], usuarios: [], catalogo: [] };
+      let ultimoContador9a = 0;
+
+      const ds9a = {
+        async transaction<T>(cb: (m: { query: (sql: string, p?: unknown[]) => Promise<unknown> }) => Promise<T>): Promise<T> {
+          return cb({
+            async query(sql: string, params?: unknown[]) {
+              if (sql === SQL_CANDADO) return [{ ultimo: '0' }];
+              if (sql === SQL_LEER_PENDIENTES) return [filaInterna];
+              if (sql === SQL_INSERTAR_FEED) { feedInsertado9a.push(params ?? []); return []; }
+              for (const dom of ['reservas', 'disponibilidad', 'usuarios', 'catalogo'] as const) {
+                if (sql === SQL_MARCAR_OUTBOX[dom]) {
+                  marcados9a[dom].push({ sequence: Number(params?.[0]), id: params?.[1] as number });
+                  return [];
+                }
+              }
+              if (sql === SQL_ACTUALIZAR_CONTADOR) { ultimoContador9a = Number(params?.[0]); return []; }
+              return [];
+            },
+          });
+        },
+      };
+
+      const pub9a = new PublicadorOutboxService(ds9a as never, rabbit);
+      const confirmados9a = await pub9a.publicarLote(500);
+
+      assert.strictEqual(confirmados9a, 1, '9a: 1 evento procesado');
+      assert.strictEqual(sim.publicados.length, 1, '9a: publicado en RabbitMQ');
+      assert.strictEqual(sim.publicados[0].routingKey, 'habitacion.limpia.lista', '9a: routing key correcto');
+      assert.strictEqual(sim.publicados[0].body.sequence, SEQUENCE_INTERNO, '9a: sequence=0 en el sobre');
+      assert.strictEqual(feedInsertado9a.length, 0, '9a: NO se inserta en comun.feed_eventos');
+      assert.deepStrictEqual(marcados9a.reservas, [{ sequence: SEQUENCE_INTERNO, id: 55 }], '9a: outbox marcado con sentinel');
+      assert.strictEqual(ultimoContador9a, 0, '9a: feed_publicador.ultimo NO se actualiza');
+    }
+
+    // 9b. Lote mixto (1 contrato + 1 interno): sequences contiguos para contrato, sentinel para interno
+    {
+      const sim = crearCanalSimulado();
+      const rabbit = new RabbitMqService(async () => sim.conexion);
+
+      const filaContrato: FilaOutboxPendiente = {
+        origen: 'reservas',
+        id: 60,
+        eventoId: 'evt-confirmada-9b',
+        tipo: 'alojamiento.reserva.confirmada',
+        sujeto: 'orders/ord-200',
+        alojamientoId: 1,
+        correlacionId: null,
+        datos: { orderId: 'ord-200', external_order_id: 'ORD-9B', estado: 'CONFIRMED', alojamientoId: 'HTL-COZY-UIO-001' },
+        creadoEn: new Date('2026-11-22T15:00:00.000Z'),
+        registradoEn: new Date('2026-11-22T15:00:00.100Z'),
+        nuevo: 1,
+      };
+      const filaInterna9b: FilaOutboxPendiente = {
+        origen: 'reservas',
+        id: 61,
+        eventoId: 'evt-limpia-9b',
+        tipo: 'habitacion.limpia.lista',
+        sujeto: 'habitaciones-fisicas/hab-9b',
+        alojamientoId: 1,
+        correlacionId: null,
+        datos: {
+          reservaId: 'res-9b',
+          alojamientoId: 'HTL-COZY-UIO-001',
+          tipoHabitacionCodigo: 'DOBLE',
+          habitacionFisicaId: 'hab-9b',
+          checkin: '2026-11-21',
+          checkout: '2026-11-23',
+          timestamp: '2026-11-23T11:00:00-05:00',
+        },
+        creadoEn: new Date('2026-11-22T15:00:01.000Z'),
+        registradoEn: new Date('2026-11-22T15:00:01.100Z'),
+        nuevo: 2,
+      };
+
+      const feedInsertado9b: unknown[][] = [];
+      const marcados9b: Record<string, { id: number | string; sequence: number }[]> = { reservas: [], disponibilidad: [], usuarios: [], catalogo: [] };
+      let ultimoContador9b = 0;
+
+      const ds9b = {
+        async transaction<T>(cb: (m: { query: (sql: string, p?: unknown[]) => Promise<unknown> }) => Promise<T>): Promise<T> {
+          return cb({
+            async query(sql: string, params?: unknown[]) {
+              if (sql === SQL_CANDADO) return [{ ultimo: '5' }]; // último sequence previo = 5
+              if (sql === SQL_LEER_PENDIENTES) return [filaContrato, filaInterna9b];
+              if (sql === SQL_INSERTAR_FEED) { feedInsertado9b.push(params ?? []); return []; }
+              for (const dom of ['reservas', 'disponibilidad', 'usuarios', 'catalogo'] as const) {
+                if (sql === SQL_MARCAR_OUTBOX[dom]) {
+                  marcados9b[dom].push({ sequence: Number(params?.[0]), id: params?.[1] as number });
+                  return [];
+                }
+              }
+              if (sql === SQL_ACTUALIZAR_CONTADOR) { ultimoContador9b = Number(params?.[0]); return []; }
+              return [];
+            },
+          });
+        },
+      };
+
+      const pub9b = new PublicadorOutboxService(ds9b as never, rabbit);
+      const confirmados9b = await pub9b.publicarLote(500);
+
+      assert.strictEqual(confirmados9b, 2, '9b: 2 eventos procesados');
+      assert.strictEqual(sim.publicados.length, 2, '9b: 2 eventos en RabbitMQ');
+      assert.strictEqual(sim.publicados[0].body.sequence, 6, '9b: contrato recibe sequence 6 (5+1)');
+      assert.strictEqual(sim.publicados[1].body.sequence, SEQUENCE_INTERNO, '9b: interno recibe sentinel');
+      assert.strictEqual(feedInsertado9b.length, 1, '9b: solo 1 inserción en feed (el contrato)');
+      assert.strictEqual(feedInsertado9b[0][0], 6, '9b: feed insertado con sequence 6');
+      // El persist-loop procesa internos primero y luego contratos
+      assert.deepStrictEqual(
+        marcados9b.reservas,
+        [
+          { sequence: SEQUENCE_INTERNO, id: 61 },
+          { sequence: 6, id: 60 },
+        ],
+        '9b: outbox: interno con sentinel (primero), contrato con 6 (después)',
+      );
+      assert.strictEqual(ultimoContador9b, 6, '9b: feed_publicador.ultimo = 6 (solo contrato)');
     }
   }
 
